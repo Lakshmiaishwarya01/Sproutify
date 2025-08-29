@@ -1,0 +1,544 @@
+# Smart Garden ML System - Updated
+# This notebook trains ML models for plant watering & nutrient automation
+
+# ---- Import required libraries ----
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+import firebase_admin
+from firebase_admin import credentials, db
+import time
+import pickle
+from google.colab import files
+import io
+
+# ---- Part 1: Setup Firebase Connection ----
+
+def setup_firebase():
+    """Initialize connection to Firebase Realtime Database"""
+    try:
+        # Check if any Firebase apps already exist
+        if not firebase_admin._apps:
+            
+            print("Please upload your Firebase service account JSON file...")
+            uploaded = files.upload()
+
+            
+            json_filename = list(uploaded.keys())[0]
+
+            
+            cred = credentials.Certificate(json_filename)
+            firebase_admin.initialize_app(cred, {
+                'databaseURL': 'https://sproutify-3a23c-default-rtdb.asia-southeast1.firebasedatabase.app'
+            })
+            print("Firebase connection established successfully!")
+        else:
+            # Firebase is already initialized
+            print("Firebase is already initialized. Using existing connection.")
+    except Exception as e:
+        print(f"Error setting up Firebase: {e}")
+        print("If Firebase is already initialized, you can continue with the next steps.")
+
+
+# ---- Part 2: Data Preparation ----
+
+def load_data():
+    """Load and prepare training data for both plants"""
+    
+    print("\nPlease upload Money Plant dataset CSV file...")
+    uploaded = files.upload()
+    money_plant_filename = list(uploaded.keys())[0]
+    money_plant_df = pd.read_csv(io.BytesIO(uploaded[money_plant_filename]))
+    
+   
+    print("\nPlease upload Water Lily dataset CSV file...")
+    uploaded = files.upload()
+    water_lily_filename = list(uploaded.keys())[0]
+    water_lily_df = pd.read_csv(io.BytesIO(uploaded[water_lily_filename]))
+    
+    
+    print("\n--- Money Plant Dataset Preview ---")
+    print(money_plant_df.head())
+    
+    print("\n--- Water Lily Dataset Preview ---")
+    print(water_lily_df.head())
+    
+    return money_plant_df, water_lily_df
+
+def preprocess_data(df):
+    """Process data for ML model training - now using Linear Regression"""
+    # Check for column names and standardize them if needed
+    print("Available columns in dataset:", df.columns.tolist())
+    
+    # Map possible column names to standardized names
+    column_mappings = {
+        # Soil moisture variants
+        'Soil Moisture': 'Soil Moisture', 
+        'soil moisture': 'Soil Moisture',
+        'SoilMoisture': 'Soil Moisture',
+        'Moisture': 'Soil Moisture',
+        'moisture': 'Soil Moisture',
+        
+        # Temperature variants
+        'Temperature': 'Temperature',
+        'temperature': 'Temperature',
+        'Temp': 'Temperature',
+        'temp': 'Temperature',
+        
+        # Humidity variants
+        'Soil Humidity': 'Soil Humidity',
+        'soil humidity': 'Soil Humidity',
+        'SoilHumidity': 'Soil Humidity',
+        'Humidity': 'Soil Humidity',
+        'humidity': 'Soil Humidity',
+        
+        # Nitrogen variants
+        'Nitrogen': 'Nitrogen',
+        'nitrogen': 'Nitrogen',
+        'N': 'Nitrogen',
+        
+        # Phosphorus variants
+        'Phosphorus': 'Phosphorus',
+        'phosphorus': 'Phosphorus',
+        'P': 'Phosphorus',
+        
+        # Potassium variants
+        'Potassium': 'Potassium',
+        'potassium': 'Potassium',
+        'K': 'Potassium'
+    }
+    
+    # Create a new dataframe with standardized column names
+    new_df = pd.DataFrame()
+    
+    # Find and map columns
+    for std_col in ['Soil Moisture', 'Temperature', 'Soil Humidity', 'Nitrogen', 'Phosphorus', 'Potassium']:
+        found = False
+        for original_col, mapped_col in column_mappings.items():
+            if mapped_col == std_col and original_col in df.columns:
+                print(f"Found '{original_col}' and mapping to '{std_col}'")
+                new_df[std_col] = df[original_col]
+                found = True
+                break
+        
+        if not found:
+            print(f"Warning: Could not find a column matching '{std_col}'. Using zeros.")
+            new_df[std_col] = 0
+    
+    # Check for missing values
+    if new_df.isnull().sum().sum() > 0:
+        print("Missing values detected. Filling with median values...")
+        new_df = new_df.fillna(new_df.median())
+    
+    # Create target based on threshold rules
+    # For moisture below 30, water pump should activate
+    new_df['Action_Water'] = (new_df['Soil Moisture'] < 30).astype(int)
+    # For any NPK below 40, nutrient pump should activate
+    new_df['Action_Nutrient'] = ((new_df['Nitrogen'] < 40) | (new_df['Phosphorus'] < 40) | (new_df['Potassium'] < 40)).astype(int)
+    
+    # Extract features and targets
+    X = new_df[['Soil Moisture', 'Temperature', 'Soil Humidity', 'Nitrogen', 'Phosphorus', 'Potassium']]
+    y_water = new_df['Action_Water']
+    y_nutrient = new_df['Action_Nutrient']
+    
+    # Split data
+    X_train, X_test, y_water_train, y_water_test = train_test_split(X, y_water, test_size=0.2, random_state=42)
+    _, _, y_nutrient_train, y_nutrient_test = train_test_split(X, y_nutrient, test_size=0.2, random_state=42)
+    
+    # Scale features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    return X_train_scaled, X_test_scaled, y_water_train, y_water_test, y_nutrient_train, y_nutrient_test, scaler
+
+# ---- Part 3: Model Training ----
+
+def train_models(money_plant_df, water_lily_df):
+    """Train ML models for both plants - using Linear Regression"""
+    models = {}
+    scalers = {}
+    
+    # Train models for Money Plant
+    print("\n=== Training Money Plant Models ===")
+    X_train, X_test, y_water_train, y_water_test, y_nutrient_train, y_nutrient_test, scaler = preprocess_data(money_plant_df)
+    
+    # Train water pump model using Linear Regression
+    print("Training Linear Regression model for water pump...")
+    water_model = LinearRegression()
+    water_model.fit(X_train, y_water_train)
+    
+    # Evaluate model
+    y_water_pred = water_model.predict(X_test)
+    # Convert predictions to binary (0 or 1)
+    y_water_pred_binary = (y_water_pred > 0.5).astype(int)
+    water_accuracy = (y_water_pred_binary == y_water_test).mean()
+    print(f"Water Pump Model Accuracy: {water_accuracy:.4f}")
+    
+    # Train nutrient pump model using Linear Regression
+    print("Training Linear Regression model for nutrient pump...")
+    nutrient_model = LinearRegression()
+    nutrient_model.fit(X_train, y_nutrient_train)
+    
+    # Evaluate model
+    y_nutrient_pred = nutrient_model.predict(X_test)
+    # Convert predictions to binary (0 or 1)
+    y_nutrient_pred_binary = (y_nutrient_pred > 0.5).astype(int)
+    nutrient_accuracy = (y_nutrient_pred_binary == y_nutrient_test).mean()
+    print(f"Nutrient Pump Model Accuracy: {nutrient_accuracy:.4f}")
+    
+    # Store Money Plant models
+    models['money_plant_water'] = water_model
+    models['money_plant_nutrient'] = nutrient_model
+    scalers['money_plant'] = scaler
+    
+    # Train models for Water Lily
+    print("\n=== Training Water Lily Models ===")
+    X_train, X_test, y_water_train, y_water_test, y_nutrient_train, y_nutrient_test, scaler_wl = preprocess_data(water_lily_df)
+    
+    # Train water pump model using Linear Regression
+    print("Training Linear Regression model for water pump...")
+    water_model = LinearRegression()
+    water_model.fit(X_train, y_water_train)
+    
+    # Evaluate model
+    y_water_pred = water_model.predict(X_test)
+    y_water_pred_binary = (y_water_pred > 0.5).astype(int)
+    water_accuracy = (y_water_pred_binary == y_water_test).mean()
+    print(f"Water Pump Model Accuracy: {water_accuracy:.4f}")
+    
+    # Train nutrient pump model using Linear Regression
+    print("Training Linear Regression model for nutrient pump...")
+    nutrient_model = LinearRegression()
+    nutrient_model.fit(X_train, y_nutrient_train)
+    
+    # Evaluate model
+    y_nutrient_pred = nutrient_model.predict(X_test)
+    y_nutrient_pred_binary = (y_nutrient_pred > 0.5).astype(int)
+    nutrient_accuracy = (y_nutrient_pred_binary == y_nutrient_test).mean()
+    print(f"Nutrient Pump Model Accuracy: {nutrient_accuracy:.4f}")
+    
+    # Store Water Lily models
+    models['water_lily_water'] = water_model
+    models['water_lily_nutrient'] = nutrient_model
+    scalers['water_lily'] = scaler_wl
+    
+    return models, scalers
+
+def save_models(models, scalers):
+    """Save models for future use"""
+    # Save Money Plant models
+    with open('money_plant_water_model.pkl', 'wb') as f:
+        pickle.dump(models['money_plant_water'], f)
+    
+    with open('money_plant_nutrient_model.pkl', 'wb') as f:
+        pickle.dump(models['money_plant_nutrient'], f)
+    
+    # Save Water Lily models  
+    with open('water_lily_water_model.pkl', 'wb') as f:
+        pickle.dump(models['water_lily_water'], f)
+    
+    with open('water_lily_nutrient_model.pkl', 'wb') as f:
+        pickle.dump(models['water_lily_nutrient'], f)
+    
+    # Save scalers
+    with open('money_plant_scaler.pkl', 'wb') as f:
+        pickle.dump(scalers['money_plant'], f)
+    
+    with open('water_lily_scaler.pkl', 'wb') as f:
+        pickle.dump(scalers['water_lily'], f)
+    
+    print("\nModels and scalers saved successfully!")
+    
+    # Download the saved models
+    files.download('money_plant_water_model.pkl')
+    files.download('money_plant_nutrient_model.pkl')
+    files.download('water_lily_water_model.pkl')
+    files.download('water_lily_nutrient_model.pkl')
+    files.download('money_plant_scaler.pkl')
+    files.download('water_lily_scaler.pkl')
+
+# ---- Part 4: Prediction System ----
+
+def get_sensor_data():
+    """Retrieve current sensor data from Firebase"""
+    try:
+        # Get Money Plant sensor data
+        mp_ref = db.reference('sensors/moneyPlant')
+        mp_data = mp_ref.get() or {}
+        
+        # Get Water Lily sensor data
+        wl_ref = db.reference('sensors/waterLily')
+        wl_data = wl_ref.get() or {}
+        
+        # Get NPK data - handle potential None values
+        n_ref = db.reference('sensors/Nitrogen')
+        p_ref = db.reference('sensors/Phosphorus')
+        k_ref = db.reference('sensors/Potassium')
+        
+        n_value = n_ref.get() or 0
+        p_value = p_ref.get() or 0
+        k_value = k_ref.get() or 0
+        
+        # Find moisture field (could be named differently in different plants)
+        mp_moisture = mp_data.get('moisture', mp_data.get('Moisture', mp_data.get('SoilMoisture', 0)))
+        wl_moisture = wl_data.get('moisture', wl_data.get('Moisture', wl_data.get('SoilMoisture', 0)))
+        
+        # Find temperature field
+        mp_temp = mp_data.get('temperature', mp_data.get('Temperature', mp_data.get('Temp', 0)))
+        wl_temp = wl_data.get('temperature', wl_data.get('Temperature', wl_data.get('Temp', 0)))
+        
+        # Find humidity field
+        mp_humid = mp_data.get('humidity', mp_data.get('Humidity', mp_data.get('SoilHumidity', 0)))
+        wl_humid = wl_data.get('humidity', wl_data.get('Humidity', wl_data.get('SoilHumidity', 0)))
+        
+        # Prepare data for prediction
+        money_plant_features = {
+            'Soil Moisture': mp_moisture,
+            'Temperature': mp_temp,
+            'Soil Humidity': mp_humid,
+            'Nitrogen': n_value,
+            'Phosphorus': p_value,
+            'Potassium': k_value
+        }
+        
+        water_lily_features = {
+            'Soil Moisture': wl_moisture,
+            'Temperature': wl_temp,
+            'Soil Humidity': wl_humid,
+            'Nitrogen': n_value,
+            'Phosphorus': p_value,
+            'Potassium': k_value
+        }
+        
+        return money_plant_features, water_lily_features
+    
+    except Exception as e:
+        print(f"Error getting sensor data: {e}")
+        print("Specific error details:", str(e))
+        return None, None
+
+def make_predictions(models, scalers, money_plant_features, water_lily_features):
+    """Use models to make predictions based on sensor data and threshold rules"""
+    try:
+        # Prepare features for predictions
+        mp_features = np.array([[
+            money_plant_features['Soil Moisture'],
+            money_plant_features['Temperature'],
+            money_plant_features['Soil Humidity'],
+            money_plant_features['Nitrogen'],
+            money_plant_features['Phosphorus'],
+            money_plant_features['Potassium']
+        ]])
+        
+        wl_features = np.array([[
+            water_lily_features['Soil Moisture'],
+            water_lily_features['Temperature'],
+            water_lily_features['Soil Humidity'],
+            water_lily_features['Nitrogen'],
+            water_lily_features['Phosphorus'],
+            water_lily_features['Potassium']
+        ]])
+        
+        # Scale features
+        mp_features_scaled = scalers['money_plant'].transform(mp_features)
+        wl_features_scaled = scalers['water_lily'].transform(wl_features)
+        
+        # Make predictions using the model
+        mp_water_pred_raw = models['money_plant_water'].predict(mp_features_scaled)[0]
+        mp_nutrient_pred_raw = models['money_plant_nutrient'].predict(mp_features_scaled)[0]
+        wl_water_pred_raw = models['water_lily_water'].predict(wl_features_scaled)[0]
+        wl_nutrient_pred_raw = models['water_lily_nutrient'].predict(wl_features_scaled)[0]
+        
+        # Convert to binary predictions
+        mp_water_pred = 1 if mp_water_pred_raw > 0.5 else 0
+        mp_nutrient_pred = 1 if mp_nutrient_pred_raw > 0.5 else 0
+        wl_water_pred = 1 if wl_water_pred_raw > 0.5 else 0
+        wl_nutrient_pred = 1 if wl_nutrient_pred_raw > 0.5 else 0
+        
+       
+        
+        mp_water_ov = 1 if money_plant_features['Soil Moisture'] < 30 else 0
+        wl_water_ov = 1 if water_lily_features['Soil Moisture'] < 30 else 0
+       
+        mp_nutrient_ov = 1 if (money_plant_features['Nitrogen'] < 40 or 
+                                     money_plant_features['Phosphorus'] < 40 or 
+                                     money_plant_features['Potassium'] < 40) else 0
+        wl_nutrient_ov = 1 if (water_lily_features['Nitrogen'] < 40 or 
+                                     water_lily_features['Phosphorus'] < 40 or 
+                                     water_lily_features['Potassium'] < 40) else 0
+        
+        # Print decision-making process
+        print("\nPrediction Process:")
+        print(f"Money Plant - Model Water Pump: {mp_water_pred}, Threshold Override: {mp_water_override}")
+        print(f"Money Plant - Model Nutrient Pump: {mp_nutrient_pred}, Threshold Override: {mp_nutrient_override}")
+        print(f"Water Lily - Model Water Pump: {wl_water_pred}, Threshold Override: {wl_water_override}")
+        print(f"Water Lily - Model Nutrient Pump: {wl_nutrient_pred}, Threshold Override: {wl_nutrient_override}")
+        
+        # Use the threshold override decisions
+        return mp_water_override, mp_nutrient_override, wl_water_override, wl_nutrient_override
+    
+    except Exception as e:
+        print(f"Error making predictions: {e}")
+        return 0, 0, 0, 0
+
+def update_pump_controls(mp_water, mp_nutrient, wl_water, wl_nutrient):
+    """Update Firebase with pump control values based on predictions"""
+    try:
+        # Update Money Plant pumps
+        mp_ref = db.reference('PumpControl/moneyPlant')
+        mp_ref.update({
+            'Pump1': int(mp_nutrient),  # Nutrient pump
+            'Pump2': int(mp_water)      # Water pump
+        })
+        
+        # Update Water Lily pump
+        wl_ref = db.reference('PumpControl/waterLily')
+        wl_ref.update({
+            'Pump3': int(wl_water)      # Water pump
+        })
+        
+        # Log predictions to the predictions node
+        pred_ref = db.reference('predictions')
+        pred_ref.update({
+            'moneyPlant_water': int(mp_water),
+            'moneyPlant_nutrient': int(mp_nutrient),
+            'waterLily_water': int(wl_water),
+            'waterLily_nutrient': int(wl_nutrient),
+            'timestamp': int(time.time())
+        })
+        
+        print(f"Pump controls updated:")
+        print(f"Money Plant - Water Pump: {mp_water}, Nutrient Pump: {mp_nutrient}")
+        print(f"Water Lily - Water Pump: {wl_water}, Nutrient Pump: {wl_nutrient}")
+        return True
+    
+    except Exception as e:
+        print(f"Error updating pump controls: {e}")
+        return False
+
+def run_prediction_loop(models, scalers, interval=300):
+    """Run continuous prediction loop"""
+    print("\nStarting prediction loop...")
+    print(f"Checking sensors every {interval} seconds")
+    
+    while True:
+        try:
+            # Get sensor data
+            mp_features, wl_features = get_sensor_data()
+            
+            if mp_features and wl_features:
+                # Display current sensor values
+                print("\nCurrent Sensor Values:")
+                print(f"Money Plant: {mp_features}")
+                print(f"Water Lily: {wl_features}")
+                
+                # Make predictions
+                mp_water, mp_nutrient, wl_water, wl_nutrient = make_predictions(models, scalers, mp_features, wl_features)
+                
+                # Update pump controls
+                update_pump_controls(mp_water, mp_nutrient, wl_water, wl_nutrient)
+            
+            else:
+                print("No sensor data available, skipping prediction cycle.")
+            
+            # Wait for next cycle
+            print(f"\nWaiting {interval} seconds until next check...")
+            time.sleep(interval)
+            
+        except KeyboardInterrupt:
+            print("\nPrediction loop stopped by user.")
+            break
+        except Exception as e:
+            print(f"Error in prediction loop: {e}")
+            print("Waiting 60 seconds before retrying...")
+            time.sleep(60)
+
+# ---- Part 5: Main Execution ----
+
+def run_once():
+    """Run a single prediction cycle for testing"""
+    print("\nRunning a single prediction cycle...")
+    
+    # Get sensor data
+    mp_features, wl_features = get_sensor_data()
+    
+    if mp_features and wl_features:
+        # Load models and scalers
+        print("Loading models and scalers...")
+        with open('money_plant_water_model.pkl', 'rb') as f:
+            mp_water_model = pickle.load(f)
+        
+        with open('money_plant_nutrient_model.pkl', 'rb') as f:
+            mp_nutrient_model = pickle.load(f)
+        
+        with open('water_lily_water_model.pkl', 'rb') as f:
+            wl_water_model = pickle.load(f)
+        
+        with open('water_lily_nutrient_model.pkl', 'rb') as f:
+            wl_nutrient_model = pickle.load(f)
+        
+        with open('money_plant_scaler.pkl', 'rb') as f:
+            mp_scaler = pickle.load(f)
+        
+        with open('water_lily_scaler.pkl', 'rb') as f:
+            wl_scaler = pickle.load(f)
+        
+        models = {
+            'money_plant_water': mp_water_model, 
+            'money_plant_nutrient': mp_nutrient_model,
+            'water_lily_water': wl_water_model, 
+            'water_lily_nutrient': wl_nutrient_model
+        }
+        scalers = {'money_plant': mp_scaler, 'water_lily': wl_scaler}
+        
+        # Display current sensor values
+        print("\nCurrent Sensor Values:")
+        print(f"Money Plant: {mp_features}")
+        print(f"Water Lily: {wl_features}")
+        
+        # Make predictions
+        mp_water, mp_nutrient, wl_water, wl_nutrient = make_predictions(models, scalers, mp_features, wl_features)
+        
+        # Update pump controls
+        update_pump_controls(mp_water, mp_nutrient, wl_water, wl_nutrient)
+        
+        print("Prediction cycle completed successfully!")
+    else:
+        print("No sensor data available.")
+
+# Main function to be executed
+def main():
+    print("=== FULLY AUTOMATED SMART GARDEN SYSTEM ===")
+    print("ML Model Training and Prediction System")
+    
+    # Step 1: Setup Firebase
+    setup_firebase()
+    
+    # Step 2: Load data
+    money_plant_df, water_lily_df = load_data()
+    
+    # Step 3: Train models
+    models, scalers = train_models(money_plant_df, water_lily_df)
+    
+    # Step 4: Save models
+    save_models(models, scalers)
+    
+    # Step 5: Run prediction loop
+    print("\nSetup complete! Ready to start prediction loop.")
+    choice = input("Would you like to:\n1. Run continuous prediction loop\n2. Run a single prediction cycle\n3. Exit\nEnter choice (1/2/3): ")
+    
+    if choice == '1':
+        interval = int(input("Enter check interval in seconds (default 300): ") or 300)
+        run_prediction_loop(models, scalers, interval)
+    elif choice == '2':
+        run_once()
+    else:
+        print("Exiting program.")
+
+# Execute main function
+if __name__ == "__main__":
+    main()
